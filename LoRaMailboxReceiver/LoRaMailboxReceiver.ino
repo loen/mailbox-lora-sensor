@@ -12,6 +12,7 @@ struct MailState {
   int rssi = 0;
   float snr = 0;
   bool hasPacket = false;
+  int batteryMv = 0;            // sender battery, 0 = not reported yet
 };
 
 // ---------- Wi-Fi (2.4 GHz only) ----------
@@ -43,6 +44,8 @@ const char* MQTT_PASS    = SECRET_MQTT_PASS;
 #define T_RSSI   "custom/mailbox/rssi"
 #define T_SNR    "custom/mailbox/snr"
 #define T_CMD    "custom/mailbox/cmd"            // RESET from Home Assistant
+#define T_BATT   "custom/mailbox/battery"          // sender battery, 0–100 %
+#define T_BATT_V "custom/mailbox/battery_voltage"  // sender battery, volts
 
 // ---------- SX1276 registers and pins ----------
 #define LORA_NSS            18
@@ -106,6 +109,24 @@ MailState getState() {
   return copy;
 }
 
+// Resting voltage of a single Li-ion / LiPo cell -> state of charge.
+// 0 % is set at 3.3 V: below that the board's 3.3 V regulator drops out anyway.
+int batteryPercent(int mv) {
+  static const int curve[][2] = {
+    {4200, 100}, {4100, 90}, {4000, 80}, {3900, 65}, {3800, 45},
+    {3750, 30},  {3700, 20}, {3650, 12}, {3600, 7},  {3500, 3}, {3300, 0}
+  };
+  const int n = sizeof(curve) / sizeof(curve[0]);
+  if (mv >= curve[0][0]) return 100;
+  for (int i = 1; i < n; i++) {
+    if (mv >= curve[i][0]) {                    // linear interpolation between two points
+      return curve[i][1] + (long) (mv - curve[i][0]) * (curve[i - 1][1] - curve[i][1]) /
+                           (curve[i - 1][0] - curve[i][0]);
+    }
+  }
+  return 0;
+}
+
 // ================= Core 0: Wi-Fi + MQTT =================
 void publishState() {
   MailState s = getState();
@@ -114,6 +135,10 @@ void publishState() {
   if (s.hasPacket) {
     mqtt.publish(T_RSSI, String(s.rssi).c_str(), true);
     mqtt.publish(T_SNR, String(s.snr, 1).c_str(), true);
+  }
+  if (s.batteryMv > 0) {
+    mqtt.publish(T_BATT, String(batteryPercent(s.batteryMv)).c_str(), true);
+    mqtt.publish(T_BATT_V, String(s.batteryMv / 1000.0, 2).c_str(), true);
   }
 }
 
@@ -211,6 +236,10 @@ void drawScreen() {
   if (s.hasPacket) {
     Heltec.display->drawString(0, 50, "RSSI " + String(s.rssi) + "  SNR " + String(s.snr, 1));
   }
+  if (s.batteryMv > 0) {
+    Heltec.display->setTextAlignment(TEXT_ALIGN_RIGHT);
+    Heltec.display->drawString(128, 3, String(batteryPercent(s.batteryMv)) + "%");
+  }
   Heltec.display->display();
 }
 
@@ -255,17 +284,24 @@ void handlePacket() {
 
   Serial.printf("Received: %s | RSSI %d dBm | SNR %.1f dB\n", p.c_str(), rssi, snr);
 
-  if (!p.startsWith("MAILBOX_OPEN;")) {
+  // Format: "<type>;<id>[;<battery mV>]", type = MAILBOX_OPEN or BATTERY (heartbeat)
+  bool isMail = p.startsWith("MAILBOX_OPEN;");
+  if (!isMail && !p.startsWith("BATTERY;")) {
     LoRa.receive();                           // foreign packet – go straight back to listening
     return;
   }
 
-  String id = p.substring(13);
+  int idStart = p.indexOf(';') + 1;
+  int idEnd = p.indexOf(';', idStart);
+  String id = (idEnd < 0) ? p.substring(idStart) : p.substring(idStart, idEnd);
+  int batteryMv = (idEnd < 0) ? 0 : p.substring(idEnd + 1).toInt();
   sendAck(id);                                // ACK immediately (radio returns to receive afterwards)
 
   long n = id.toInt();
-  bool isNew = (n != lastId);
-  if (isNew) {
+  bool isNew = isMail && (n != lastId);
+  if (!isMail) {
+    Serial.printf("Battery report: %d mV (%d %%)\n", batteryMv, batteryPercent(batteryMv));
+  } else if (isNew) {
     lastId = n;
     mailTime = millis();
     digitalWrite(LED, HIGH);
@@ -277,6 +313,7 @@ void handlePacket() {
   state.rssi = rssi;
   state.snr = snr;
   state.hasPacket = true;
+  if (batteryMv > 0) state.batteryMv = batteryMv;
   if (isNew) {
     state.mail = true;
     state.count++;
